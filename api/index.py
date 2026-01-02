@@ -8,8 +8,7 @@ from fastapi import FastAPI, Request, HTTPException
 
 BASE = "https://hmomen.com"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = os.getenv("OWNER_ID", "").strip()  # optional
-
+OWNER_ID = os.getenv("OWNER_ID", "8387548755").strip()  # optional
 # Telegram limits: 4096 chars per message. Keep a safety margin.
 TG_LIMIT = 3500
 
@@ -172,34 +171,22 @@ def clean_detail_text(html: str) -> Tuple[str, str]:
         "المحتوى",
         "القرآن الكريم",
         "الرئيسية",
-        "تحميل التطبيق",
+        "هل صليت على محمد وآل محمد",
         "أنضم إلينا",
         "جميع الحقوق",
     }
 
     lines = []
-for line in text.splitlines():
-    line = line.strip()
-    if not line:
-        continue
-
-    # احذف الوقت مثل 00:00
-    if time_like.match(line):
-        continue
-
-    # احذف أي سطر يحتوي رابط الموقع
-    if "hmomen.com" in line:
-        continue
-
-    # احذف عناصر الواجهة
-    if any(line.startswith(b) for b in bad_starts):
-        continue
-
-    # احذف عناوين القوائم المتكررة
-    if line in {"الأدعية", "الزيارات"}:
-        continue
-
-    lines.append(line)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(line.startswith(b) for b in bad_starts):
+            continue
+        # remove repeated menu headers
+        if line in {"الأدعية", "الزيارات"}:
+            continue
+        lines.append(line)
 
     # try to start after title occurrence
     body = "\n".join(lines)
@@ -333,4 +320,3 @@ async def telegram_webhook(request: Request) -> Dict[str, str]:
             await show_detail(chat_id, message_id, sub_id, href)
 
     return {"status": "ok"}
-
