@@ -178,25 +178,16 @@ def clean_detail_text(html: str) -> Tuple[str, str]:
     }
 
     lines = []
-    time_like = re.compile(r"^\s*\d{1,2}:\d{2}\s*$")  # مثل 00:00
-
-for line in text.splitlines():
-    line = line.strip()
-    if not line:
-        continue
-
-    # احذف سطور الوقت مثل 00:00
-    if time_like.match(line):
-        continue
-
-    if any(line.startswith(b) for b in bad_starts):
-        continue
-
-    # remove repeated menu headers
-    if line in {"الأدعية", "الزيارات"}:
-        continue
-
-    lines.append(line)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(line.startswith(b) for b in bad_starts):
+            continue
+        # remove repeated menu headers
+        if line in {"الأدعية", "الزيارات"}:
+            continue
+        lines.append(line)
 
     # try to start after title occurrence
     body = "\n".join(lines)
