@@ -148,7 +148,7 @@ def parse_list(html: str) -> List[Tuple[str, str]]:
         seen.add(key)
         out.append((title, href))
 
-    # keep order as page order
+    # simple heuristic: keep order as page order
     return out
 
 
@@ -177,30 +177,26 @@ def clean_detail_text(html: str) -> Tuple[str, str]:
         "جميع الحقوق",
     }
 
+    lines = []
     time_like = re.compile(r"^\s*\d{1,2}:\d{2}\s*$")  # مثل 00:00
 
-    lines = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+for line in text.splitlines():
+    line = line.strip()
+    if not line:
+        continue
 
-        # احذف سطور الوقت مثل 00:00
-        if time_like.match(line):
-            continue
+    # احذف سطور الوقت مثل 00:00
+    if time_like.match(line):
+        continue
 
-        # احذف أي سطر يحتوي رابط الموقع (حتى لو ظهر داخل النص)
-        if "hmomen.com" in line:
-            continue
+    if any(line.startswith(b) for b in bad_starts):
+        continue
 
-        if any(line.startswith(b) for b in bad_starts):
-            continue
+    # remove repeated menu headers
+    if line in {"الأدعية", "الزيارات"}:
+        continue
 
-        # remove repeated menu headers
-        if line in {"الأدعية", "الزيارات"}:
-            continue
-
-        lines.append(line)
+    lines.append(line)
 
     # try to start after title occurrence
     body = "\n".join(lines)
@@ -261,8 +257,8 @@ async def show_detail(chat_id: int, message_id: int, sub_id: str, href: str) -> 
         return
 
     header = f"{title}\n\n" if title else ""
-    # ✅ بدون ذكر المصدر أو الرابط
-    full = (header + body).strip()
+    footer = f"\n\nالمصدر: {BASE}{href}"
+    full = (header + body + footer).strip()
 
     parts = chunk_text(full)
 
@@ -271,7 +267,7 @@ async def show_detail(chat_id: int, message_id: int, sub_id: str, href: str) -> 
     for p in parts[1:]:
         await send_message(chat_id, p)
 
-    # navigation buttons (separate message)
+    # send navigation buttons in a separate message (so we don't fight message length)
     nav = keyboard([
         ("⬅️ رجوع للقائمة", f"sub|{sub_id}"),
         ("⬅️ رجوع للقسم", f"cat|{cat}"),
@@ -323,17 +319,12 @@ async def telegram_webhook(request: Request) -> Dict[str, str]:
         kind = parts[0] if parts else ""
 
         if kind == "back" and len(parts) > 1 and parts[1] == "main":
-            await edit_message(
-                chat_id,
-                message_id,
-                "اختر قسمًا من الأقسام التالية:",
-                keyboard([(c, f"cat|{c}") for c in SECTIONS.keys()], cols=1),
-            )
+            await edit_message(chat_id, message_id, "اختر قسمًا من الأقسام التالية:", keyboard([(c, f"cat|{c}") for c in SECTIONS.keys()], cols=1))
         elif kind == "cat" and len(parts) > 1:
             await show_subcategories(chat_id, message_id, parts[1])
         elif kind == "sub" and len(parts) > 1:
             await show_items(chat_id, message_id, parts[1])
-       elif kind == "it" and len(parts) > 2:
+        elif kind == "it" and len(parts) > 2:
             sub_id = parts[1]
             href = parts[2]
             await show_detail(chat_id, message_id, sub_id, href)
