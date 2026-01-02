@@ -1,476 +1,323 @@
-"""
-Telegram Bot FastAPI handler for serverless deployment on Vercel.
-
-This module implements a FastAPI application that receives webhook updates
-from Telegram and responds with structured religious content. The bot uses
-a dictionary to represent the content hierarchy (categories, sub‑categories
-and items) and encodes navigation in the callback_data of inline keyboard
-buttons so that no persistent state is required.  The bot does not run
-long‑lived processes; instead, it responds to each webhook invocation
-independently, which makes it suitable for serverless environments such
-as Vercel.  The Telegram bot token should be provided as an environment
-variable named ``BOT_TOKEN`` at deploy time.
-
-Note: Do not commit your actual bot token to version control. Configure
-the environment on Vercel with ``BOT_TOKEN``.  For local testing you can
-export the variable in your shell before running.
-"""
-
 import os
-import asyncio
-from typing import Dict, Any
+import re
+from typing import Dict, List, Tuple, Optional
 
 import httpx
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, Request, HTTPException
 
+BASE = "https://hmomen.com"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = os.getenv("OWNER_ID", "").strip()  # optional
 
-def _build_content() -> Dict[str, Dict[str, Dict[str, Dict[str, str]]]]:
-    """Return the hierarchical content structure for the bot.
+# Telegram limits: 4096 chars per message. Keep a safety margin.
+TG_LIMIT = 3500
 
-    The structure is a nested dictionary: top‑level keys are categories,
-    second‑level keys are sub‑categories, third‑level keys are item names.
-    Each item value is a mapping with optional ``text`` and ``url`` fields.
+# =========================
+# Content map (list pages)
+# =========================
+# sub_id is used in callback_data (short & stable)
+SECTIONS: Dict[str, Dict[str, Dict[str, str]]] = {
+    "الأدعية": {
+        "الأدعية العامة": {"id": "dua", "path": "/content/dua"},
+        "أدعية الأيام": {"id": "days", "path": "/content/days"},
+        "تعقيبات الصلاة": {"id": "taq", "path": "/content/taqeebat"},
+        "الصلوات على الحجج الطاهرين": {"id": "sal", "path": "/content/sallats"},
+    },
+    "الزيارات": {
+        "الزيارات العامة": {"id": "zyg", "path": "/content/zyarat"},
+        "زيارة الأئمة في أيام الأسبوع": {"id": "dzy", "path": "/content/days_zyarat"},
+    },
+    "المناجات والتسابيح": {
+        "المناجات": {"id": "mon", "path": "/content/monajat"},
+        "التسابيح": {"id": "tas", "path": "/content/days_tasbih"},
+    },
+    "الأعمال": {
+        "محرم": {"id": "muh", "path": "/content/muharram"},
+        "صفر": {"id": "saf", "path": "/content/safar"},
+        "ربيع الأول": {"id": "rab1", "path": "/content/rabiulawal"},
+        "رجب": {"id": "raj", "path": "/content/rajab"},
+        "شعبان": {"id": "sha", "path": "/content/shaban"},
+        "شوال": {"id": "shw", "path": "/content/shawwal"},
+        "ذو القعدة": {"id": "dq", "path": "/content/dhulqadah"},
+        "ذو الحجة": {"id": "dh", "path": "/content/dhualhijjah"},
+    },
+}
 
-    This function encapsulates the content definition so that it can be
-    extended or modified without altering the rest of the code.  The
-    religious content here is intentionally brief and primarily links to
-    external resources, respecting copyright and attribution requirements.
-    """
+# quick reverse index for callbacks
+SUB_BY_ID: Dict[str, Tuple[str, str, str]] = {}
+for cat, subs in SECTIONS.items():
+    for sub_name, meta in subs.items():
+        SUB_BY_ID[meta["id"]] = (cat, sub_name, meta["path"])
 
-    return {
-        "الأدعية": {
-            "الأدعية العامة": {
-                "دعاء كميل": {
-                    "text": "دعاء كميل هو دعاء معروف ينسب للإمام علي بن أبي طالب عليه السلام.",
-                    "url": "https://hmomen.com/duaa/general/duaa-kumail"
-                },
-                "دعاء الجوشن الكبير": {
-                    "text": "دعاء الجوشن الكبير يُقرأ في ليالي شهر رمضان المبارك.",
-                    "url": "https://hmomen.com/duaa/general/duaa-jawshan-kabir"
-                },
-                "دعاء الندبة": {
-                    "text": "دعاء الندبة يُقرأ في الأعياد الأربعة ويُظهر الشوق للإمام المنتظر.",
-                    "url": "https://hmomen.com/duaa/general/duaa-nudba"
-                },
-                "دعاء الافتتاح": {
-                    "text": "دعاء الافتتاح يُقرأ في ليالي شهر رمضان ويتضمن الثناء على الله والدعاء للنبي وأهل بيته.",
-                    "url": "https://hmomen.com/duaa/general/duaa-iftitah"
-                }
-            },
-            "أدعية الأيام": {
-                "دعاء يوم السبت": {
-                    "text": "دعاء مخصوص يُقرأ يوم السبت يطلب فيه من الله الفرج والتوفيق.",
-                    "url": "https://hmomen.com/duaa/days/saturday"
-                },
-                "دعاء يوم الأحد": {
-                    "text": "دعاء يوم الأحد، يبتدئ بالحمد لله ويطلب الستر والمغفرة.",
-                    "url": "https://hmomen.com/duaa/days/sunday"
-                },
-                "دعاء يوم الاثنين": {
-                    "text": "دعاء يوم الاثنين يطلب العفو والرزق الحلال.",
-                    "url": "https://hmomen.com/duaa/days/monday"
-                },
-                "دعاء يوم الثلاثاء": {
-                    "text": "دعاء يوم الثلاثاء يتوسل إلى الله بأسماء الأنبياء عليهم السلام.",
-                    "url": "https://hmomen.com/duaa/days/tuesday"
-                },
-                "دعاء يوم الأربعاء": {
-                    "text": "دعاء يوم الأربعاء يدعو للتوفيق والبركة.",
-                    "url": "https://hmomen.com/duaa/days/wednesday"
-                },
-                "دعاء يوم الخميس": {
-                    "text": "دعاء يوم الخميس يطلب المغفرة والتسديد.",
-                    "url": "https://hmomen.com/duaa/days/thursday"
-                },
-                "دعاء يوم الجمعة": {
-                    "text": "دعاء يوم الجمعة يُكثر فيه الثناء على الله والصلاة على محمد وآله.",
-                    "url": "https://hmomen.com/duaa/days/friday"
-                }
-            },
-            "تعقيبات الصلاة": {
-                "أذكار بعد الصلاة": {
-                    "text": "مجموعة من الأذكار والتسبيحات تقال بعد الصلوات الخمس.",
-                    "url": "https://hmomen.com/duaa/after-prayers"
-                }
-            },
-            "الصلوات على الحجج الطاهرين": {
-                "الصلاة على النبي وأهل بيته": {
-                    "text": "صلوات خاصة على النبي صلى الله عليه وآله والأئمة الأطهار.",
-                    "url": "https://hmomen.com/duaa/salawat"
-                }
-            }
-        },
-        "الزيارات": {
-            "الزيارات العامة": {
-                "زيارة عاشوراء": {
-                    "text": "زيارة عاشوراء تُقرأ لإحياء ذكرى الإمام الحسين عليه السلام.",
-                    "url": "https://hmomen.com/ziyarat/general/ziyarat-ashura"
-                },
-                "الزيارة الجامعة الكبيرة": {
-                    "text": "زيارة الجامعة الكبيرة نصٌ جامع لزيارة الأئمة الأطهار.",
-                    "url": "https://hmomen.com/ziyarat/general/universial"
-                }
-            },
-            "زيارة الأئمة في أيام الأسبوع": {
-                "زيارة الإمام أمير المؤمنين يوم الاثنين": {
-                    "text": "زيارة قصيرة تُقرأ للإمام علي بن أبي طالب يوم الاثنين.",
-                    "url": "https://hmomen.com/ziyarat/week/imam-ali-monday"
-                },
-                "زيارة الإمام الحسين يوم الثلاثاء": {
-                    "text": "زيارة قصيرة تُقرأ للإمام الحسين يوم الثلاثاء.",
-                    "url": "https://hmomen.com/ziyarat/week/imam-husayn-tuesday"
-                },
-                "زيارة الإمام الكاظم والجواد يوم الأربعاء": {
-                    "text": "زيارة تُقرأ للإمامين موسى الكاظم ومحمد الجواد يوم الأربعاء.",
-                    "url": "https://hmomen.com/ziyarat/week/imam-kadhim-jawad-wednesday"
-                },
-                "زيارة الإمام الرضا والإمام الهادي يوم الخميس": {
-                    "text": "زيارة تُقرأ للإمامين علي الرضا وعلي الهادي يوم الخميس.",
-                    "url": "https://hmomen.com/ziyarat/week/imam-redha-hadi-thursday"
-                },
-                "زيارة النبي الأكرم يوم الجمعة": {
-                    "text": "زيارة قصيرة تُقرأ للنبي محمد صلى الله عليه وآله يوم الجمعة.",
-                    "url": "https://hmomen.com/ziyarat/week/prophet-friday"
-                }
-            }
-        },
-        "المناجات والتسابيح": {
-            "المناجات": {
-                "مناجاة التائبين": {
-                    "text": "مناجاة التائبين مناجاة توبة وندم.",
-                    "url": "https://hmomen.com/munajat/repentant"
-                },
-                "مناجاة الشاكرين": {
-                    "text": "مناجاة الشاكرين تشكر الله على نعمه.",
-                    "url": "https://hmomen.com/munajat/grateful"
-                },
-                "مناجاة المحبين": {
-                    "text": "مناجاة المحبين تعبّر عن حب الله.",
-                    "url": "https://hmomen.com/munajat/lovers"
-                }
-            },
-            "التسابيح": {
-                "تسبيح يوم السبت": {
-                    "text": "تسبيح يقال يوم السبت يتضمن ذكر الله والتضرع.",
-                    "url": "https://hmomen.com/tasbih/saturday"
-                },
-                "تسبيح يوم الأحد": {
-                    "text": "تسبيح يوم الأحد يحوي تمجيدًا لله عز وجل.",
-                    "url": "https://hmomen.com/tasbih/sunday"
-                },
-                "تسبيح يوم الاثنين": {
-                    "text": "تسبيح يوم الاثنين يدعو لله بالرحمة.",
-                    "url": "https://hmomen.com/tasbih/monday"
-                },
-                "تسبيح يوم الثلاثاء": {
-                    "text": "تسبيح يوم الثلاثاء يتضمن الحمد والشكر.",
-                    "url": "https://hmomen.com/tasbih/tuesday"
-                },
-                "تسبيح يوم الأربعاء": {
-                    "text": "تسبيح يوم الأربعاء يكثر فيه الاستغفار.",
-                    "url": "https://hmomen.com/tasbih/wednesday"
-                },
-                "تسبيح يوم الخميس": {
-                    "text": "تسبيح يوم الخميس يشتمل على الثناء والتقديس.",
-                    "url": "https://hmomen.com/tasbih/thursday"
-                },
-                "تسبيح يوم الجمعة": {
-                    "text": "تسبيح يوم الجمعة يُستحب إكثاره، ويشمل الصلاة على محمد وآله.",
-                    "url": "https://hmomen.com/tasbih/friday"
-                }
-            }
-        },
-        "الأعمال": {
-            "محرم": {
-                "أعمال الليلة الأولى": {
-                    "text": "أعمال عبادة لليلة الأولى من شهر محرم.",
-                    "url": "https://hmomen.com/amal/muharram/night1"
-                },
-                "أعمال اليوم الأول": {
-                    "text": "أعمال اليوم الأول تشمل الصيام والدعاء.",
-                    "url": "https://hmomen.com/amal/muharram/day1"
-                },
-                "أعمال يوم التاسع": {
-                    "text": "أعمال يوم التاسع من محرم تتضمن زيارة الإمام الحسين.",
-                    "url": "https://hmomen.com/amal/muharram/day9"
-                },
-                "أعمال يوم العاشر": {
-                    "text": "أعمال عاشوراء تتضمن الدعاء والبكاء على الإمام الحسين.",
-                    "url": "https://hmomen.com/amal/muharram/day10"
-                }
-            },
-            "صفر": {
-                "أعمال اليوم الأول": {
-                    "text": "أعمال اليوم الأول من شهر صفر تتضمن الصدقة والصلاة.",
-                    "url": "https://hmomen.com/amal/safar/day1"
-                },
-                "أعمال اليوم الثالث والعشرين": {
-                    "text": "أعمال اليوم الثالث والعشرين من صفر تشمل زيارة الإمام الحسين.",
-                    "url": "https://hmomen.com/amal/safar/day23"
-                }
-            },
-            "ربيع الأول": {
-                "أعمال اليوم الأول": {
-                    "text": "أعمال اليوم الأول من ربيع الأول.",
-                    "url": "https://hmomen.com/amal/rabee1/day1"
-                },
-                "أعمال اليوم الثاني عشر": {
-                    "text": "أعمال اليوم الثاني عشر تشمل الاحتفال بمولد النبي.",
-                    "url": "https://hmomen.com/amal/rabee1/day12"
-                },
-                "أعمال الليلة التاسعة عشرة": {
-                    "text": "أعمال الليلة التاسعة عشرة من ربيع الأول.",
-                    "url": "https://hmomen.com/amal/rabee1/night19"
-                }
-            },
-            "رجب": {
-                "أعمال الليلة الثالثة": {
-                    "text": "أعمال الليلة الثالثة من شهر رجب.",
-                    "url": "https://hmomen.com/amal/rajab/night3"
-                },
-                "أعمال الليلة الرابعة": {
-                    "text": "أعمال الليلة الرابعة من رجب.",
-                    "url": "https://hmomen.com/amal/rajab/night4"
-                },
-                "أعمال الليلة الخامسة": {
-                    "text": "أعمال الليلة الخامسة من رجب.",
-                    "url": "https://hmomen.com/amal/rajab/night5"
-                },
-                "أعمال الليلة التاسعة": {
-                    "text": "أعمال الليلة التاسعة من رجب.",
-                    "url": "https://hmomen.com/amal/rajab/night9"
-                },
-                "أعمال الليلة الرابعة والعشرين": {
-                    "text": "أعمال الليلة الرابعة والعشرين من رجب.",
-                    "url": "https://hmomen.com/amal/rajab/night24"
-                }
-            },
-            "شعبان": {
-                "أعمال اليوم الأول": {
-                    "text": "أعمال اليوم الأول من شعبان.",
-                    "url": "https://hmomen.com/amal/shaban/day1"
-                },
-                "أعمال اليوم الثاني": {
-                    "text": "أعمال اليوم الثاني من شعبان.",
-                    "url": "https://hmomen.com/amal/shaban/day2"
-                },
-                "أعمال اليوم الثالث": {
-                    "text": "أعمال اليوم الثالث من شعبان.",
-                    "url": "https://hmomen.com/amal/shaban/day3"
-                }
-            },
-            "شوال": {
-                "أعمال الليلة الأولى": {
-                    "text": "أعمال الليلة الأولى من شوال.",
-                    "url": "https://hmomen.com/amal/shawwal/night1"
-                },
-                "أعمال اليوم الأول": {
-                    "text": "أعمال اليوم الأول من شوال وتشمل صلاة العيد.",
-                    "url": "https://hmomen.com/amal/shawwal/day1"
-                }
-            },
-            "ذو القعدة": {
-                "أعمال عامة": {
-                    "text": "أعمال عامة لشهر ذو القعدة.",
-                    "url": "https://hmomen.com/amal/zulqadah/general"
-                },
-                "أعمال اليوم الخامس": {
-                    "text": "أعمال اليوم الخامس من ذو القعدة.",
-                    "url": "https://hmomen.com/amal/zulqadah/day5"
-                },
-                "أعمال اليوم الحادي عشر": {
-                    "text": "أعمال اليوم الحادي عشر من ذو القعدة.",
-                    "url": "https://hmomen.com/amal/zulqadah/day11"
-                },
-                "أعمال اليوم الثالث والعشرون": {
-                    "text": "أعمال اليوم الثالث والعشرون من ذو القعدة.",
-                    "url": "https://hmomen.com/amal/zulqadah/day23"
-                },
-                "أعمال الليلة الخامسة عشر": {
-                    "text": "أعمال الليلة الخامسة عشر من ذو القعدة.",
-                    "url": "https://hmomen.com/amal/zulqadah/night15"
-                },
-                "أعمال من الثامن عشر إلى نهاية الشهر": {
-                    "text": "أعمال الثلث الأخير من شهر ذو القعدة.",
-                    "url": "https://hmomen.com/amal/zulqadah/after18"
-                }
-            },
-            "ذو الحجة": {
-                "أعمال اليوم الأول حتى اليوم العاشر": {
-                    "text": "أعمال الأيام العشرة الأولى من ذو الحجة تتضمن أعمال الحج والتقرب.",
-                    "url": "https://hmomen.com/amal/zulhijjah/day1-10"
-                },
-                "أعمال اليوم الثامن عشر": {
-                    "text": "أعمال اليوم الثامن عشر من ذو الحجة، يوم الغدير.",
-                    "url": "https://hmomen.com/amal/zulhijjah/day18"
-                },
-                "أعمال اليوم الرابع والعشرين": {
-                    "text": "أعمال اليوم الرابع والعشرين من ذو الحجة.",
-                    "url": "https://hmomen.com/amal/zulhijjah/day24"
-                },
-                "أعمال اليوم الثلاثون": {
-                    "text": "أعمال اليوم الثلاثون من ذو الحجة.",
-                    "url": "https://hmomen.com/amal/zulhijjah/day30"
-                }
-            }
-        }
+
+# =========================
+# Telegram helpers
+# =========================
+async def tg_request(method: str, payload: dict) -> dict:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(str(data))
+        return data
+
+
+async def send_message(chat_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    await tg_request("sendMessage", payload)
+
+
+async def edit_message(chat_id: int, message_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    await tg_request("editMessageText", payload)
+
+
+def keyboard(buttons: List[Tuple[str, str]], cols: int = 2) -> dict:
+    rows = []
+    row = []
+    for label, cb in buttons:
+        row.append({"text": label, "callback_data": cb})
+        if len(row) >= cols:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return {"inline_keyboard": rows}
+
+
+def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
+    text = text.strip()
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    i = 0
+    while i < len(text):
+        j = min(i + limit, len(text))
+        # try to split on paragraph boundary
+        cut = text.rfind("\n\n", i, j)
+        if cut == -1 or cut <= i + 200:
+            cut = text.rfind("\n", i, j)
+        if cut == -1 or cut <= i + 200:
+            cut = j
+        chunks.append(text[i:cut].strip())
+        i = cut
+    return [c for c in chunks if c]
+
+
+# =========================
+# hmomen.com parsing
+# =========================
+async def fetch_html(path_or_url: str) -> str:
+    url = path_or_url
+    if url.startswith("/"):
+        url = BASE + url
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.text
+
+
+def parse_list(html: str) -> List[Tuple[str, str]]:
+    """Return [(title, href_path)] from a list page."""
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[Tuple[str, str]] = []
+    seen = set()
+
+    for a in soup.find_all("a"):
+        href = (a.get("href") or "").strip()
+        title = a.get_text(" ", strip=True)
+        if not href.startswith("/content/"):
+            continue
+        if not title or len(title) > 120:
+            continue
+        # ignore section roots like /content/dua itself
+        if href.count("/") <= 2:
+            continue
+        key = (title, href)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((title, href))
+
+    # simple heuristic: keep order as page order
+    return out
+
+
+def clean_detail_text(html: str) -> Tuple[str, str]:
+    """Extract (title, body_text) from a detail page."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # title
+    h1 = soup.find("h1")
+    title = h1.get_text(" ", strip=True) if h1 else ""
+
+    # remove noise
+    for tag in soup(["script", "style", "nav", "footer", "header"]):
+        tag.decompose()
+
+    text = soup.get_text("\n", strip=True)
+
+    # drop common UI lines
+    bad_starts = {
+        "روابط مهمة",
+        "المحتوى",
+        "القرآن الكريم",
+        "الرئيسية",
+        "تحميل التطبيق",
+        "أنضم إلينا",
+        "جميع الحقوق",
     }
 
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(line.startswith(b) for b in bad_starts):
+            continue
+        # remove repeated menu headers
+        if line in {"الأدعية", "الزيارات"}:
+            continue
+        lines.append(line)
 
-CONTENT = _build_content()
+    # try to start after title occurrence
+    body = "\n".join(lines)
+    if title and title in body:
+        idx = body.find(title)
+        body = body[idx + len(title):].strip()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    # If the token is missing, raise an exception on startup so that the
-    # deployment fails early.  The user must provide the token in the
-    # environment on Vercel.  For local testing, set it manually.
-    raise RuntimeError(
-        "BOT_TOKEN environment variable is not set. Please configure your bot token"
-    )
+    # compress excessive blank lines
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
 
-
-async def send_message(chat_id: int, text: str, reply_markup: Dict[str, Any] | None = None) -> None:
-    """Send a message to a Telegram chat using the Bot API.
-
-    Args:
-        chat_id: The recipient chat ID.
-        text: The message text.
-        reply_markup: Optional inline keyboard markup structure.
-    """
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "reply_markup": reply_markup},
-            timeout=15,
-        )
+    return title.strip(), body
 
 
-async def edit_message(chat_id: int, message_id: int, text: str, reply_markup: Dict[str, Any] | None = None) -> None:
-    """Edit a previously sent message.
-
-    Args:
-        chat_id: The chat identifier.
-        message_id: The message identifier to edit.
-        text: The new text.
-        reply_markup: Optional updated inline keyboard markup.
-    """
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
-            json={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "reply_markup": reply_markup,
-            },
-            timeout=15,
-        )
+# =========================
+# Bot logic
+# =========================
+async def show_main(chat_id: int) -> None:
+    btns = [(cat, f"cat|{cat}") for cat in SECTIONS.keys()]
+    await send_message(chat_id, "اختر قسمًا من الأقسام التالية:", keyboard(btns, cols=1))
 
 
-def build_keyboard(options: Dict[str, Any], prefix: str) -> Dict[str, Any]:
-    """Build an inline keyboard for a list of options.
-
-    Args:
-        options: A mapping of option names to nested dicts or values.
-        prefix: A prefix string used to build callback_data identifiers.
-
-    Returns:
-        A dict representing the inline keyboard markup.
-    """
-    keyboard: list[list[Dict[str, str]]] = []
-    for key in options.keys():
-        keyboard.append([
-            {
-                "text": key,
-                "callback_data": f"{prefix}|{key}"
-            }
-        ])
-    return {"inline_keyboard": keyboard}
+async def show_subcategories(chat_id: int, message_id: int, category: str) -> None:
+    subs = SECTIONS.get(category, {})
+    btns = [(name, f"sub|{subs[name]['id']}") for name in subs.keys()]
+    btns.append(("⬅️ رجوع", "back|main"))
+    await edit_message(chat_id, message_id, f"{category}: اختر قسمًا فرعيًا:", keyboard(btns, cols=1))
 
 
-async def handle_message(message: Dict[str, Any]) -> None:
-    """Handle incoming standard text messages.
+async def show_items(chat_id: int, message_id: int, sub_id: str) -> None:
+    if sub_id not in SUB_BY_ID:
+        await edit_message(chat_id, message_id, "القسم غير موجود.")
+        return
+    cat, sub_name, path = SUB_BY_ID[sub_id]
 
-    When a user sends any message, the bot responds by presenting the top‑level
-    categories for navigation.
-    """
-    chat_id = message["chat"]["id"]
-    text = "اختر قسمًا من الأقسام التالية:"  # "Choose a category from the following:"
-    reply_markup = build_keyboard(CONTENT, "cat")
-    await send_message(chat_id, text, reply_markup)
-
-
-async def handle_callback_query(callback_query: Dict[str, Any]) -> None:
-    """Handle callback queries from inline keyboard buttons.
-
-    The callback_data is expected to contain pipe‑separated identifiers
-    describing the path in the content structure.  For example:
-    - "cat|الأدعية"
-    - "sub|الأدعية|الأدعية العامة"
-    - "item|الأدعية|الأدعية العامة|دعاء كميل"
-    """
-    data = callback_query.get("data", "")
-    message = callback_query.get("message")
-    chat_id = message["chat"]["id"]
-    message_id = message["message_id"]
-
-    parts = data.split("|")
-    if not parts:
+    html = await fetch_html(path)
+    items = parse_list(html)
+    if not items:
+        await edit_message(chat_id, message_id, "ماكو محتوى ظاهر بهذا القسم حالياً.")
         return
 
-    kind = parts[0]
-    if kind == "cat" and len(parts) == 2:
-        category = parts[1]
-        sub_options = CONTENT.get(category, {})
-        text = f"اختر قسمًا فرعيًا من {category}:"
-        reply_markup = build_keyboard(sub_options, f"sub|{category}")
-        await edit_message(chat_id, message_id, text, reply_markup)
-    elif kind == "sub" and len(parts) == 3:
-        category = parts[1]
-        subcategory = parts[2]
-        items = CONTENT.get(category, {}).get(subcategory, {})
-        text = f"اختر موضوعًا من {subcategory}:"
-        reply_markup = build_keyboard(items, f"item|{category}|{subcategory}")
-        await edit_message(chat_id, message_id, text, reply_markup)
-    elif kind == "item" and len(parts) == 4:
-        category = parts[1]
-        subcategory = parts[2]
-        item_name = parts[3]
-        entry = CONTENT.get(category, {}).get(subcategory, {}).get(item_name, {})
-        text = entry.get("text", "")
-        url = entry.get("url")
-        if url:
-            text += f"\n\n📎 رابط: {url}"
-        await edit_message(chat_id, message_id, text)
-    else:
-        # Unrecognized callback; simply ignore
-        pass
+    # callback_data max 64 bytes: keep it short
+    btns = [(t, f"it|{sub_id}|{h}") for (t, h) in items[:90]]
+    btns.append(("⬅️ رجوع", f"cat|{cat}"))
+    await edit_message(chat_id, message_id, f"{cat} › {sub_name}: اختر عنصرًا:", keyboard(btns, cols=1))
 
 
+async def show_detail(chat_id: int, message_id: int, sub_id: str, href: str) -> None:
+    if sub_id not in SUB_BY_ID:
+        await edit_message(chat_id, message_id, "القسم غير موجود.")
+        return
+    cat, sub_name, _ = SUB_BY_ID[sub_id]
+
+    html = await fetch_html(href)
+    title, body = clean_detail_text(html)
+
+    if not body:
+        await edit_message(chat_id, message_id, "ما قدرت أستخرج النص من الصفحة.")
+        return
+
+    header = f"{title}\n\n" if title else ""
+    footer = f"\n\nالمصدر: {BASE}{href}"
+    full = (header + body + footer).strip()
+
+    parts = chunk_text(full)
+
+    # edit first message, then send the rest
+    await edit_message(chat_id, message_id, parts[0])
+    for p in parts[1:]:
+        await send_message(chat_id, p)
+
+    # send navigation buttons in a separate message (so we don't fight message length)
+    nav = keyboard([
+        ("⬅️ رجوع للقائمة", f"sub|{sub_id}"),
+        ("⬅️ رجوع للقسم", f"cat|{cat}"),
+    ], cols=1)
+    await send_message(chat_id, "التنقل:", nav)
+
+
+# =========================
+# Webhook handler
+# =========================
 app = FastAPI()
 
 
 @app.post("/")
 async def telegram_webhook(request: Request) -> Dict[str, str]:
-    """Endpoint to receive Telegram webhook updates.
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="BOT_TOKEN is not configured")
 
-    This route receives both standard messages and callback queries.  It
-    processes them asynchronously and acknowledges receipt by returning
-    immediately with a simple JSON payload.
-    """
     try:
         update = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
 
-    # Handle message (text or command)
+    # message
     if "message" in update:
-        # Only react to text messages; ignore other types (stickers, photos, etc.)
-        if update["message"].get("text"):
-            await handle_message(update["message"])
-    # Handle callback query from inline buttons
-    elif "callback_query" in update:
-        await handle_callback_query(update["callback_query"])
+        msg = update["message"]
+        text = (msg.get("text") or "").strip()
+        chat_id = msg["chat"]["id"]
 
-    # Always respond with OK to acknowledge receipt
+        if text in {"/start", "start", "ابدأ"}:
+            await show_main(chat_id)
+        elif text == "/id":
+            await send_message(chat_id, f"chat_id: {chat_id}")
+        else:
+            await show_main(chat_id)
+
+    # callback query
+    elif "callback_query" in update:
+        cq = update["callback_query"]
+        data = cq.get("data") or ""
+        message = cq.get("message") or {}
+        chat_id = message.get("chat", {}).get("id")
+        message_id = message.get("message_id")
+
+        if not (chat_id and message_id):
+            return {"status": "ok"}
+
+        parts = data.split("|", 3)
+        kind = parts[0] if parts else ""
+
+        if kind == "back" and len(parts) > 1 and parts[1] == "main":
+            await edit_message(chat_id, message_id, "اختر قسمًا من الأقسام التالية:", keyboard([(c, f"cat|{c}") for c in SECTIONS.keys()], cols=1))
+        elif kind == "cat" and len(parts) > 1:
+            await show_subcategories(chat_id, message_id, parts[1])
+        elif kind == "sub" and len(parts) > 1:
+            await show_items(chat_id, message_id, parts[1])
+        elif kind == "it" and len(parts) > 2:
+            sub_id = parts[1]
+            href = parts[2]
+            await show_detail(chat_id, message_id, sub_id, href)
+
     return {"status": "ok"}
